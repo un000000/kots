@@ -1,8 +1,8 @@
 // KotlinOTGameServer.kt
 package org.example
 
-import java.io.File
-import java.math.BigInteger
+import ChecksumMethod
+import adlerChecksum
 import java.net.InetSocketAddress
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -10,299 +10,9 @@ import java.nio.channels.SelectionKey
 import java.nio.channels.Selector
 import java.nio.channels.ServerSocketChannel
 import java.nio.channels.SocketChannel
-import java.util.Base64
 import java.util.concurrent.Executors
 import kotlin.random.Random
 
-/*
-// ---------------- Custom RSA Implementation (matching C++ logic) ----------------
-class CustomRSA {
-    private var n: BigInteger = BigInteger.ZERO  // modulus (p * q)
-    private var d: BigInteger = BigInteger.ZERO  // private exponent
-
-    // Default hardcoded values from C++ (fallback keys)
-    private val defaultP = "14299623962416399520070177382898895550795403345466153217470516082934737582776038882967213386204600674145392845853859217990626450972452084065728686565928113"
-    private val defaultQ = "7630979195970404721891201847792002125535401292779123937207447574596692788513647179235335529307251350570728407373705564708871762033017096809910315212884101"
-
-    fun start(keyPath: String = "key.pem") {
-        try {
-            if (!loadPEM(keyPath)) {
-                println("File $keyPath not found or have problem on loading... Setting standard rsa key")
-                setKey(defaultP, defaultQ, 10)
-            }
-        } catch (e: Exception) {
-            println("Loading RSA Key from $keyPath failed with error: ${e.message}")
-            println("Switching to a default key...")
-            setKey(defaultP, defaultQ, 10)
-        }
-    }
-
-    /**
-     * Set RSA key from p and q strings (matching C++ setKey function)
-     * @param pString prime p as string
-     * @param qString prime q as string
-     * @param base number base (10 for decimal, 16 for hex)
-     */
-    fun setKey(pString: String, qString: String, base: Int = 10) {
-        val p = BigInteger(pString, base)
-        val q = BigInteger(qString, base)
-        val e = BigInteger.valueOf(65537) // standard RSA public exponent
-
-        // n = p * q
-        // n = p.multiply(q).mod(BigInteger("2").pow(64))
-        n = BigInteger("aab33dbe8d5b7ff5", 16)
-
-        // d = e^-1 mod (p-1)(q-1)
-        val p1 = p.subtract(BigInteger.ONE)
-        val q1 = q.subtract(BigInteger.ONE)
-        val pq1 = p1.multiply(q1) // φ(n) = (p-1)(q-1)
-
-        // d = e^-1 mod φ(n)
-        // d = e.modInverse(pq1).mod(BigInteger("2").pow(64))
-        d = BigInteger("df443761aefe8d81", 16)
-    }
-
-    /**
-     * Decrypt message in place (matching C++ decrypt function)
-     * Expects exactly 128 bytes of encrypted data
-     */
-    fun decrypt(msg: ByteArray) {
-        require(msg.size >= 128) { "Message must be at least 128 bytes" }
-
-        // Import 128 bytes as big integer (big endian, unsigned)
-        val c = BigInteger(1, msg.copyOfRange(0, 128))
-
-        // m = c^d mod n
-        val m = c.modPow(d, n)
-
-        // Convert back to bytes
-        val decryptedBytes = m.toByteArray()
-
-        // Calculate padding needed (similar to C++ logic)
-        val count = decryptedBytes.size
-        val padding = 128 - count
-
-        // Clear the message buffer first
-        msg.fill(0, 0, 128)
-
-        // Copy decrypted bytes to the right position (right-aligned)
-        if (count > 0) {
-            // Handle the case where toByteArray() might include a sign byte
-            val sourceStart = if (decryptedBytes[0] == 0.toByte() && decryptedBytes.size > 1) 1 else 0
-            val actualCount = decryptedBytes.size - sourceStart
-            val actualPadding = 128 - actualCount
-
-            System.arraycopy(decryptedBytes, sourceStart, msg, actualPadding, actualCount)
-        }
-    }
-
-    /**
-     * Base64 decode with custom character mapping (matching C++ implementation)
-     */
-    fun base64Decrypt(input: String): ByteArray {
-        if (input.isEmpty()) return ByteArray(0)
-
-        fun posOfCharacter(chr: Byte): Int {
-            val c = chr.toInt() and 0xFF
-            return when (c) {
-                in 'A'.code..'Z'.code -> c - 'A'.code
-                in 'a'.code..'z'.code -> c - 'a'.code + ('Z'.code - 'A'.code) + 1
-                in '0'.code..'9'.code -> c - '0'.code + ('Z'.code - 'A'.code) + ('z'.code - 'a'.code) + 2
-                '+'.code, '-'.code -> 62
-                '/'.code, '_'.code -> 63
-                else -> {
-                    println("Invalid base64 character: ${c.toChar()}")
-                    0
-                }
-            }
-        }
-
-        val length = input.length
-        var pos = 0
-        val output = mutableListOf<Byte>()
-
-        while (pos < length) {
-            if (pos + 1 >= length) break
-
-            val pos0 = posOfCharacter(input[pos].code.toByte())
-            val pos1 = posOfCharacter(input[pos + 1].code.toByte())
-
-            output.add(((pos0 shl 2) + ((pos1 and 0x30) shr 4)).toByte())
-
-            if (pos + 2 < length && input[pos + 2] != '=' && input[pos + 2] != '.') {
-                val pos2 = posOfCharacter(input[pos + 2].code.toByte())
-                output.add((((pos1 and 0x0f) shl 4) + ((pos2 and 0x3c) shr 2)).toByte())
-
-                if (pos + 3 < length && input[pos + 3] != '=' && input[pos + 3] != '.') {
-                    val pos3 = posOfCharacter(input[pos + 3].code.toByte())
-                    output.add((((pos2 and 0x03) shl 6) + pos3).toByte())
-                }
-            }
-
-            pos += 4
-        }
-
-        return output.toByteArray()
-    }
-
-    /**
-     * Load PEM file and extract p, q values (matching C++ loadPEM function)
-     */
-    private fun loadPEM(filename: String): Boolean {
-        val file = File(filename)
-        if (!file.exists()) return false
-
-        val key = file.readText().replace(Regex("\\r?\\n"), "")
-
-        val headerOld = "-----BEGIN RSA PRIVATE KEY-----"
-        val footerOld = "-----END RSA PRIVATE KEY-----"
-        val headerNew = "-----BEGIN PRIVATE KEY-----"
-        val footerNew = "-----END PRIVATE KEY-----"
-
-        val decodedKey = when {
-            key.startsWith(headerOld) -> {
-                if (!key.endsWith(footerOld)) {
-                    println("Missing RSA private key footer")
-                    return false
-                }
-                base64Decrypt(key.substring(headerOld.length, key.length - footerOld.length))
-            }
-            key.startsWith(headerNew) -> {
-                if (!key.endsWith(footerNew)) {
-                    println("Missing RSA private key footer")
-                    return false
-                }
-                base64Decrypt(key.substring(headerNew.length, key.length - footerNew.length))
-            }
-            else -> {
-                println("Missing RSA private key header")
-                return false
-            }
-        }
-
-        return parseASN1RSAKey(decodedKey)
-    }
-
-    /**
-     * Parse ASN.1 DER encoded RSA private key (simplified version of C++ logic)
-     */
-    private fun parseASN1RSAKey(keyData: ByteArray): Boolean {
-        try {
-            val reader = ASN1Reader(keyData)
-
-            // Parse SEQUENCE
-            if (!reader.expectTag(0x30)) return false
-            reader.readLength()
-
-            // Handle PKCS#8 wrapper if present
-            var tag = reader.peekTag()
-            if (tag == 0x02) {
-                // Could be version or direct PKCS#1
-                val version = reader.readInteger()
-                if (version == BigInteger.ZERO || version == BigInteger.ONE) {
-                    // This might be PKCS#1 version, continue
-                } else {
-                    // Could be PKCS#8, skip algorithm identifier
-                    if (!reader.expectTag(0x30)) return false
-                    val algLen = reader.readLength()
-                    reader.skipBytes(algLen)
-
-                    // Read OCTET STRING containing PKCS#1 data
-                    if (!reader.expectTag(0x04)) return false
-                    val pkcs1Len = reader.readLength()
-                    val pkcs1Data = reader.readBytes(pkcs1Len)
-                    return parseASN1RSAKey(pkcs1Data) // Recursive call for inner PKCS#1
-                }
-            }
-
-            // Parse PKCS#1 RSAPrivateKey
-            // Skip version if we haven't read it yet
-            if (tag == 0x02) {
-                reader.readInteger() // version
-            }
-
-            // Skip modulus (n), publicExponent (e), privateExponent (d)
-            reader.readInteger() // n (modulus)
-            reader.readInteger() // e (public exponent)
-            reader.readInteger() // d (private exponent)
-
-            // Read p and q
-            val p = reader.readInteger()
-            val q = reader.readInteger()
-
-            // Convert to hex strings and set key (matching C++ behavior)
-            val pString = p.toString(16).uppercase()
-            val qString = q.toString(16).uppercase()
-
-            setKey(pString, qString, 16)
-            return true
-
-        } catch (e: Exception) {
-            println("Error parsing ASN.1 RSA key: ${e.message}")
-            return false
-        }
-    }
-
-    /**
-     * Simple ASN.1 DER reader (matching C++ decodeLength and readHexString functionality)
-     */
-    private class ASN1Reader(private val data: ByteArray) {
-        private var pos = 0
-
-        fun expectTag(expectedTag: Int): Boolean {
-            if (pos >= data.size) return false
-            val tag = data[pos++].toInt() and 0xFF
-            return tag == expectedTag
-        }
-
-        fun peekTag(): Int {
-            if (pos >= data.size) return -1
-            return data[pos].toInt() and 0xFF
-        }
-
-        fun readLength(): Int {
-            if (pos >= data.size) throw IllegalStateException("Unexpected EOF")
-
-            val first = data[pos++].toInt() and 0xFF
-            return if (first and 0x80 != 0) {
-                val numBytes = first and 0x7F
-                if (numBytes > 4) throw IllegalStateException("Length too large")
-
-                var length = 0
-                repeat(numBytes) {
-                    if (pos >= data.size) throw IllegalStateException("Unexpected EOF")
-                    length = (length shl 8) or (data[pos++].toInt() and 0xFF)
-                }
-                length
-            } else {
-                first
-            }
-        }
-
-        fun readInteger(): BigInteger {
-            if (!expectTag(0x02)) throw IllegalStateException("Expected INTEGER tag")
-            val length = readLength()
-            if (length == 0) return BigInteger.ZERO
-
-            val bytes = readBytes(length)
-            return BigInteger(1, bytes) // Positive number
-        }
-
-        fun readBytes(length: Int): ByteArray {
-            if (pos + length > data.size) throw IllegalStateException("Unexpected EOF")
-            val result = data.copyOfRange(pos, pos + length)
-            pos += length
-            return result
-        }
-
-        fun skipBytes(length: Int) {
-            if (pos + length > data.size) throw IllegalStateException("Unexpected EOF")
-            pos += length
-        }
-    }
-}
-
- */
 // ---------------- Updated RsaDecryptor using CustomRSA ----------------
 class RsaDecryptor(private val customRSA: CustomRSA) {
     // RSA block size is always 128 bytes (1024 bits) to match C++ implementation
@@ -330,6 +40,7 @@ class NetworkBuffer(private val buf: ByteArray) {
     fun getByte(): Int = bb.get().toInt() and 0xFF
     fun getShort(): Int = bb.short.toInt() and 0xFFFF
     fun getInt(): Int = bb.int
+    fun getUInt(): Long = bb.int.toLong() and 0xFFFFFFFFL
     fun getBytes(len: Int): ByteArray {
         val out = ByteArray(len)
         bb.get(out)
@@ -486,12 +197,14 @@ data class ParsedLogin(
     val randomByte: Int
 )
 
+
 // ---------------- Updated GameServer using CustomRSA ----------------
 class GameServer(private val port: Int, private val pemPath: String) {
     private lateinit var protocol: GameProtocol
     private lateinit var rsaDecryptor: RsaDecryptor
     private lateinit var customRSA: CustomRSA
 
+    private var serverSequenceNumber: Int = 0
     fun start() {
         println("Initializing Custom RSA")
         customRSA = CustomRSA()
@@ -524,6 +237,42 @@ class GameServer(private val port: Int, private val pemPath: String) {
         }
     }
 
+    fun addCryptoHeader(
+        payload: ByteArray,
+        method: ChecksumMethod,
+        doCompression: Boolean = false
+    ): ByteArray {
+        // If SEQUENCE, mark compression flag if compression was done
+        val compressionFlag = if (doCompression) (1 shl 31) else 0
+
+        val checksum: Int? = when (method) {
+            ChecksumMethod.NONE -> null
+            ChecksumMethod.ADLER32 -> adlerChecksum(payload, payload.size)
+            ChecksumMethod.SEQUENCE -> {
+                serverSequenceNumber++
+                if (serverSequenceNumber >= 0x7FFFFFFF) {
+                    serverSequenceNumber = 0
+                }
+                compressionFlag or serverSequenceNumber
+            }
+        }
+
+        val out = ByteBuffer
+            .allocate(2 + (if (checksum != null) 4 else 0) + payload.size)
+            .order(ByteOrder.LITTLE_ENDIAN)
+
+        // Outer length = (checksum?4:0 + payload.size)
+        val outerLen = (if (checksum != null) 4 else 0) + payload.size
+        out.putShort(outerLen.toShort())
+
+        if (checksum != null) {
+            out.putInt(checksum)
+        }
+
+        out.put(payload)
+        return out.array()
+    }
+
     private fun handleClient(client: SocketChannel) {
         try {
             val sock = client.socket()
@@ -542,6 +291,7 @@ class GameServer(private val port: Int, private val pemPath: String) {
             println("Received packet ${packet.size} bytes")
             val parsed = protocol.parseGameLoginPacket(packet)
             if (parsed != null) {
+                sendSrakenPierdaken(client, parsed.xteaKey)
                 println("Parsed login: account='${parsed.accountDescriptor}' char='${parsed.characterName}'")
             } else {
                 println("Failed to parse login packet")
@@ -582,6 +332,37 @@ class GameServer(private val port: Int, private val pemPath: String) {
             println("Sent challenge ts=$ts rand=${rand.toInt() and 0xFF}")
         } catch (e: Exception) {
             println("Failed challenge: ${e.message}")
+        }
+    }
+    private fun sendSrakenPierdaken(client: SocketChannel, xteaKey: IntArray?) {
+        try {
+            val messageStr = "Sraken pierdaken"
+            val message = messageStr.toByteArray()
+
+            val inner = ByteBuffer
+                .allocate(2 + 3 + message.size)
+                .order(ByteOrder.LITTLE_ENDIAN)
+
+            // inner length (will be encrypted) = 3 + message.size
+            inner.putShort((3 + message.size).toShort())
+
+            inner.put(0x14)
+            inner.put(message.size.toByte())
+            inner.put(0x00)
+            inner.put(message)
+
+            val innerBytes = inner.array()
+
+            // 1) Encrypt inner with XTEA if key exists
+            val encrypted = if (xteaKey != null) Xtea.encrypt(innerBytes, xteaKey) else innerBytes
+
+            // 2) Wrap with outer header (pick your checksum mode)
+            val finalPacket = addCryptoHeader(encrypted, ChecksumMethod.SEQUENCE)
+
+            client.write(ByteBuffer.wrap(finalPacket))
+            println("Sent TreleMorele (Checksum=${ChecksumMethod.SEQUENCE}, XTEA=${xteaKey != null})")
+        } catch (e: Exception) {
+            println("sendTreleMorele failed :( : ${e.message}")
         }
     }
 
