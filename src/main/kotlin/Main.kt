@@ -11,6 +11,7 @@ import java.nio.channels.Selector
 import java.nio.channels.ServerSocketChannel
 import java.nio.channels.SocketChannel
 import java.util.concurrent.Executors
+import java.util.zip.Adler32
 import kotlin.math.pow
 import kotlin.random.Random
 
@@ -42,6 +43,10 @@ class NetworkBuffer(private val buf: ByteArray) {
     fun getShort(): Int = bb.short.toInt() and 0xFFFF
     fun getInt(): Int = bb.int
     fun getUInt(): Long = bb.int.toLong() and 0xFFFFFFFFL
+    fun getU8(): Int = bb.get().toInt() and 0xFF
+    fun getU16(): Int = bb.short.toInt() and 0xFFFF
+    fun getU32(): UInt = (bb.int.toLong() and 0xFFFFFFFFL).toUInt()
+
     fun getBytes(len: Int): ByteArray {
         val out = ByteArray(len)
         bb.get(out)
@@ -55,8 +60,7 @@ class NetworkBuffer(private val buf: ByteArray) {
     }
     fun readTibiaString(): String {
         if (remaining() < 2) return ""
-        val len = getShort()
-        if (len == 0) return ""
+        val len = getU16()
         val bytes = getBytes(len)
         return String(bytes, Charsets.UTF_8)
     }
@@ -87,12 +91,12 @@ class GameProtocol(private val rsaDecryptor: RsaDecryptor) {
                 println("Packet too short")
                 return null
             }
-            nb.getInt()
-            nb.getByte()
-            val os = nb.getShort()
-            val version = nb.getShort()
+            val randomTrash = nb.getU32()
+            val randomTrash2 = nb.getU8()
+            val os = nb.getU16()
+            val version = nb.getU16()
             val oldProtocol = version <= 1100
-            val clientVersion = nb.getInt()
+            val clientVersion = nb.getU32()
             println("OS=$os version=$version oldProtocol=$oldProtocol clientVersion=$clientVersion")
 
             var versionString: String? = null
@@ -107,14 +111,10 @@ class GameProtocol(private val rsaDecryptor: RsaDecryptor) {
                 }
             }
             if (version < 1334 && nb.remaining() >= 2) {
-                datRevision = nb.getShort()
+                datRevision = nb.getU16()
                 println("datRevision=$datRevision")
             }
 
-            if (nb.remaining() < 1) {
-                println("missing preview")
-                return null
-            }
             val preview = nb.getByte()
             println("preview=$preview")
 
@@ -127,10 +127,10 @@ class GameProtocol(private val rsaDecryptor: RsaDecryptor) {
             println("RSA decrypted OK")
 
             // XTEA key
-            var xtea: IntArray? = null
+            var xtea: UIntArray? = null
             if (nb.remaining() >= 16) {
-                val arr = IntArray(4)
-                for (i in 0..3) arr[i] = nb.getInt()
+                val arr = UIntArray(4)
+                for (i in 0..3) arr[i] = nb.getU32()
                 xtea = arr
                 println("XTEA: ${arr.joinToString { "0x${it.toString(16)}" }}")
             }
@@ -184,12 +184,12 @@ data class ParsedLogin(
     val operatingSystem: Int,
     val version: Int,
     val oldProtocol: Boolean,
-    val clientVersion: Int,
+    val clientVersion: UInt,
     val versionString: String?,
     val assetHash: String?,
     val datRevision: Int?,
     val previewState: Int,
-    val xteaKey: IntArray?,
+    val xteaKey: UIntArray?,
     val isGameMaster: Boolean,
     val accountDescriptor: String,
     val password: String,
@@ -204,6 +204,7 @@ class GameServer(private val port: Int, private val pemPath: String) {
     private lateinit var protocol: GameProtocol
     private lateinit var rsaDecryptor: RsaDecryptor
     private lateinit var customRSA: CustomRSA
+    private var packetSequence = 0
 
     private var serverSequenceNumber: Int = 0
     fun start() {
@@ -277,18 +278,15 @@ class GameServer(private val port: Int, private val pemPath: String) {
     private fun handleClient(client: SocketChannel) {
         try {
             val sock = client.socket()
+            /*
             val handshake = readHandshake(client)
             println("Handshake from ${sock.remoteSocketAddress}: '$handshake'")
-            if (handshake != "OTServBR-Global") {
-                println("Invalid handshake, closing")
-                client.close()
-                return
-            }
-            sendChallenge(client)
+             */
             val packet = readPacket(client) ?: run {
                 println("Failed reading packet")
                 client.close(); return
             }
+            sendChallenge(client)
             println("Received packet ${packet.size} bytes")
             val parsed = protocol.parseGameLoginPacket(packet)
             if (parsed != null) {
@@ -401,109 +399,135 @@ class GameServer(private val port: Int, private val pemPath: String) {
             inner.put(0xFF.toByte())
         }
     }
-
-    private fun sendAddCreature(client: SocketChannel, xteaKey: IntArray?) {
-        try{
-            val storeImagesUrl = "http://127.0.0.1/images/store/"
-            val inner = ByteBuffer
-                //.allocate(27 + storeImagesUrl.toByteArray().size + 2)
-                .allocate(512)
-                .order(ByteOrder.LITTLE_ENDIAN)
-            inner.put(0x17)
-            inner.putInt(268435464)
-            inner.putShort(50)
-            putDoubleWithPrecision(inner, 857.36)
-            putDoubleWithPrecision(inner, 261.29)
-            putDoubleWithPrecision(inner, -4795.01)
-            inner.put(0x00)
-            inner.put(0x00)
-            putCipString(inner, storeImagesUrl)
-
-            inner.putShort(25)
-            inner.put(0x00)
-
-            appendAllowBugReport(inner, true)
-            appendTibiaTime(inner, 0)
-            appendPendingStateEntered(inner)
-            appendEnterWorld(inner)
-            val pos = Position(17568, 17406, 7)
-            appendMapDescription(inner,pos)
-            //appendMagicEffect(inner, pos)
-            inner.put(0x75.toByte())
-            inner.put(0xff.toByte())
-            inner.put(0xa3.toByte())
-            inner.put(0x11.toByte())
-            inner.put(0x61.toByte())
-            inner.put(0x00.toByte())
-            inner.put(0x00.toByte())
-            inner.put(0x00.toByte())
-            inner.put(0x00.toByte())
-            inner.put(0x00.toByte())
-            inner.put(0x06.toByte())
-            inner.put(0x00.toByte())
-            inner.put(0x00.toByte())
-            inner.put(0x10.toByte())
-            inner.put(0x00.toByte())
-            inner.put(0x03.toByte())
-            inner.put(0x00.toByte())
-            inner.put(0x47.toByte())
-            inner.put(0x4f.toByte())
-            inner.put(0x44.toByte())
-            inner.put(0x64.toByte())
-            inner.put(0x02.toByte())
-            inner.put(0x88.toByte())
-            inner.put(0x00.toByte())
-            inner.put(0x5f.toByte())
-            inner.put(0x71.toByte())
-            inner.put(0x27.toByte())
-            inner.put(0x73.toByte())
-            inner.put(0x00.toByte())
-            inner.put(0x00.toByte())
-            inner.put(0x00.toByte())
-            inner.put(0xff.toByte())
-            inner.put(0xd7.toByte())
-            inner.put(0xff.toByte())
-            inner.put(0xff.toByte())
-            inner.put(0x00.toByte())
-            inner.put(0x00.toByte())
-            inner.put(0x00.toByte())
-            inner.put(0x00.toByte())
-            inner.put(0x00.toByte())
-            inner.put(0x00.toByte())
-            inner.put(0x00.toByte())
-            inner.put(0xff.toByte())
-            inner.put(0x00.toByte())
-            inner.put(0x00.toByte())
-            inner.put(0xff.toByte())
-            inner.put(0xff.toByte())
-            inner.put(0xff.toByte())
-            inner.put(0xff.toByte())
-            inner.put(0xff.toByte())
-            inner.put(0xff.toByte())
-            inner.put(0xff.toByte())
-            inner.put(0xff.toByte())
-            inner.put(0xff.toByte())
-            inner.put(0xff.toByte())
-            inner.put(0xff.toByte())
-            inner.put(0xff.toByte())
-            inner.put(0xff.toByte())
-            inner.put(0xff.toByte())
-            inner.put(0x69.toByte())
-            inner.put(0xff.toByte())
-            inner.put(0x00.toByte())
-
-            val innerBytes = inner.array()
-
-            val encrypted = if (xteaKey != null) Xtea.encrypt(innerBytes, xteaKey) else innerBytes
-
-            val finalPacket = addCryptoHeader(encrypted, ChecksumMethod.SEQUENCE)
-
-            client.write(ByteBuffer.wrap(finalPacket))
-        } catch (e: Exception){
-
-        }
+    private fun nextSequenceNumber(): Int {
+        val seq = packetSequence
+        packetSequence = (packetSequence + 1) and 0xFFFF // wrap for U16
+        return seq
     }
-    private fun sendSrakenPierdaken(client: SocketChannel, xteaKey: IntArray?) {
+    private  fun writeCreaturePacket(inner: ByteBuffer){
+        val storeImagesUrl = "http://127.0.0.1/images/store/"
+
+        inner.put(0x17)
+        inner.putInt(268435464)
+        inner.putShort(50)
+        putDoubleWithPrecision(inner, 857.36)
+        putDoubleWithPrecision(inner, 261.29)
+        putDoubleWithPrecision(inner, -4795.01)
+        inner.put(0x00)
+        inner.put(0x00)
+        putCipString(inner, storeImagesUrl)
+
+        inner.putShort(25)
+        inner.put(0x00)
+
+        appendAllowBugReport(inner, true)
+        appendTibiaTime(inner, 0)
+        appendPendingStateEntered(inner)
+        appendEnterWorld(inner)
+        val pos = Position(17568, 17406, 7)
+        appendMapDescription(inner,pos)
+        //appendMagicEffect(inner, pos)
+        inner.put(0x75.toByte())
+        inner.put(0xff.toByte())
+        inner.put(0xa3.toByte())
+        inner.put(0x11.toByte())
+        inner.put(0x61.toByte())
+        inner.put(0x00.toByte())
+        inner.put(0x00.toByte())
+        inner.put(0x00.toByte())
+        inner.put(0x00.toByte())
+        inner.put(0x00.toByte())
+        inner.put(0x06.toByte())
+        inner.put(0x00.toByte())
+        inner.put(0x00.toByte())
+        inner.put(0x10.toByte())
+        inner.put(0x00.toByte())
+        inner.put(0x03.toByte())
+        inner.put(0x00.toByte())
+        inner.put(0x47.toByte())
+        inner.put(0x4f.toByte())
+        inner.put(0x44.toByte())
+        inner.put(0x64.toByte())
+        inner.put(0x02.toByte())
+        inner.put(0x88.toByte())
+        inner.put(0x00.toByte())
+        inner.put(0x5f.toByte())
+        inner.put(0x71.toByte())
+        inner.put(0x27.toByte())
+        inner.put(0x73.toByte())
+        inner.put(0x00.toByte())
+        inner.put(0x00.toByte())
+        inner.put(0x00.toByte())
+        inner.put(0xff.toByte())
+        inner.put(0xd7.toByte())
+        inner.put(0xff.toByte())
+        inner.put(0xff.toByte())
+        inner.put(0x00.toByte())
+        inner.put(0x00.toByte())
+        inner.put(0x00.toByte())
+        inner.put(0x00.toByte())
+        inner.put(0x00.toByte())
+        inner.put(0x00.toByte())
+        inner.put(0x00.toByte())
+        inner.put(0xff.toByte())
+        inner.put(0x00.toByte())
+        inner.put(0x00.toByte())
+        inner.put(0xff.toByte())
+        inner.put(0xff.toByte())
+        inner.put(0xff.toByte())
+        inner.put(0xff.toByte())
+        inner.put(0xff.toByte())
+        inner.put(0xff.toByte())
+        inner.put(0xff.toByte())
+        inner.put(0xff.toByte())
+        inner.put(0xff.toByte())
+        inner.put(0xff.toByte())
+        inner.put(0xff.toByte())
+        inner.put(0xff.toByte())
+        inner.put(0xff.toByte())
+        inner.put(0xff.toByte())
+        inner.put(0x69.toByte())
+        inner.put(0xff.toByte())
+        inner.put(0x00.toByte())
+    }
+
+    private fun sendAddCreature(client: SocketChannel, xteaKey: UIntArray?) {
+        // 1. Write message content
+        val body = ByteBuffer.allocate(1024).order(ByteOrder.LITTLE_ENDIAN)
+        writeCreaturePacket(body)
+        val bodyBytes = body.array().copyOf(body.position())
+
+        // 2. PADDING (writePaddingAmount)
+        val paddingCount = (8 - ((bodyBytes.size + 1) % 8)) % 8
+        val padded = ByteArray(bodyBytes.size + paddingCount + 1)
+        System.arraycopy(bodyBytes, 0, padded, 0, bodyBytes.size)
+        // pad bytes are zero
+        padded[padded.size - 1] = paddingCount.toByte() // last byte = pad count
+
+        // 3. XTEA encrypt (if key provided)
+        val encrypted = if (xteaKey != null) Xtea.encrypt(padded, xteaKey) else return
+
+        // 4. addCryptoHeader (CHECKSUM_METHOD_SEQUENCE)
+        val blockCount = encrypted.paddingSize / 8
+        var seq = nextSequenceNumber()
+        if (seq >= 0x7FFFFFFF) seq = 0
+        val header = ByteBuffer.allocate(2 + 4).order(ByteOrder.LITTLE_ENDIAN)
+        header.putShort(blockCount.toShort())      // u16 block count
+        header.putInt(seq)                         // u32 checksum/sequence
+        header.flip()
+
+        // 5. Combine header + encrypted payload
+        val finalPacket = ByteBuffer.allocate(header.remaining() + encrypted.data.size)
+        finalPacket.put(header)
+        finalPacket.put(encrypted.data)
+        finalPacket.flip()
+
+        // 6. send
+        client.write(finalPacket)
+    }
+
+
+    private fun sendSrakenPierdaken(client: SocketChannel, xteaKey: UIntArray?) {
         try {
             val messageStr = "Sraken pierdaken"
             val message = messageStr.toByteArray()
@@ -521,10 +545,10 @@ class GameServer(private val port: Int, private val pemPath: String) {
             val innerBytes = inner.array()
 
             // 1) Encrypt inner with XTEA if key exists
-            val encrypted = if (xteaKey != null) Xtea.encrypt(innerBytes, xteaKey) else innerBytes
+            val encrypted = if (xteaKey != null) Xtea.encrypt(innerBytes, xteaKey) else return
 
             // 2) Wrap with outer header (pick your checksum mode)
-            val finalPacket = addCryptoHeader(encrypted, ChecksumMethod.SEQUENCE)
+            val finalPacket = addCryptoHeader(encrypted.data, ChecksumMethod.SEQUENCE)
 
             client.write(ByteBuffer.wrap(finalPacket))
             println("Sent TreleMorele (Checksum=${ChecksumMethod.SEQUENCE}, XTEA=${xteaKey != null})")
@@ -546,7 +570,7 @@ class GameServer(private val port: Int, private val pemPath: String) {
         if (size <= 0 || size > 65535) {
             println("Invalid size: $size"); return null
         }
-        val payload = ByteBuffer.allocate(size)
+        val payload = ByteBuffer.allocate(167)
         var total = 0
         while (total < size) {
             val r = client.read(payload)

@@ -1,10 +1,10 @@
-fun adlerChecksum(data: ByteArray, length: Int): Int {
+fun adlerChecksum(data: ByteArray, length: Int, start: Int = 0): Int {
     if (length > 0xFFFF) return 0 // same guard as NETWORKMESSAGE_MAXSIZE
 
     val MOD_ADLER = 65521
     var a = 1
     var b = 0
-    var i = 0
+    var i = start
     var remaining = length
 
     while (remaining > 0) {
