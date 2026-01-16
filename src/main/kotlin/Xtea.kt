@@ -1,94 +1,57 @@
 package org.example
 
+// Put this anywhere top-level in the file (e.g., above GameServer)
 object Xtea {
     private const val ROUNDS = 32
-    private const val DELTA = 0x61C88647u
+    private const val DELTA = 0x61C88647.toInt() // same as Protocol::XTEA_transform
 
-    data class EncryptResult(val data: ByteArray, val paddingSize: Int)
+    /**
+     * Encrypts the given bytes with the 128-bit XTEA key.
+     * Pads with zeros to a multiple of 8 (like Protocol::XTEA_encrypt).
+     */
+    fun encrypt(data: ByteArray, key: IntArray): ByteArray {
+        require(key.size == 4) { "XTEA key must be 4 x 32-bit ints" }
 
-    fun encrypt(data: ByteArray, key: UIntArray): EncryptResult {
-        require(key.size == 4) { "XTEA key must be 4 x 32-bit UInts" }
+        val pad = (8 - (data.size % 8)) % 8
+        val out = data.copyOf(data.size + pad)
 
-        // Calculate padding needed to make size multiple of 8
-        val paddingBytes = (8 - (data.size % 8)) % 8
-        val buffer = if (paddingBytes > 0) {
-            data + ByteArray(paddingBytes) { 0x33.toByte() }
-        } else {
-            data.copyOf()
+        // Precompute control sums exactly like the C++ version
+        val ctrl = Array(ROUNDS) { IntArray(2) }
+        var sum = 0
+        for (i in 0 until ROUNDS) {
+            ctrl[i][0] = sum + key[sum and 3]
+            sum -= DELTA
+            ctrl[i][1] = sum + key[(sum ushr 11) and 3]
         }
 
-        transform(buffer, key, true)
-        return EncryptResult(buffer, paddingBytes)
-    }
+        var i = 0
+        while (i < out.size) {
+            var v0 =  (out[i].toInt() and 0xFF) or
+                    ((out[i+1].toInt() and 0xFF) shl 8) or
+                    ((out[i+2].toInt() and 0xFF) shl 16) or
+                    ((out[i+3].toInt() and 0xFF) shl 24)
+            var v1 =  (out[i+4].toInt() and 0xFF) or
+                    ((out[i+5].toInt() and 0xFF) shl 8) or
+                    ((out[i+6].toInt() and 0xFF) shl 16) or
+                    ((out[i+7].toInt() and 0xFF) shl 24)
 
-    fun decrypt(data: ByteArray, key: UIntArray, paddingSize: Int): ByteArray {
-        require(key.size == 4) { "XTEA key must be 4 x 32-bit UInts" }
-        require(data.size % 8 == 0) { "Encrypted buffer must be multiple of 8 bytes" }
-
-        val buffer = data.copyOf()
-        transform(buffer, key, false)
-
-        // Remove padding - return only the meaningful data
-        val actualSize = buffer.size - paddingSize
-        require(actualSize >= 0) { "Invalid padding size" }
-
-        return buffer.copyOfRange(0, actualSize)
-    }
-
-    private fun transform(buffer: ByteArray, key: UIntArray, encrypt: Boolean) {
-        // Initial sum: 0 for encrypt, delta * rounds for decrypt
-        var sum: UInt = if (encrypt) 0u else (DELTA * ROUNDS.toUInt())
-
-        // Precompute control sums exactly like Canary
-        val cs = Array(ROUNDS) { UIntArray(2) }
-
-        if (encrypt) {
-            for (i in 0 until ROUNDS) {
-                cs[i][0] = sum + key[(sum and 3u).toInt()]
-                sum -= DELTA
-                cs[i][1] = sum + key[((sum shr 11) and 3u).toInt()]
+            for (r in 0 until ROUNDS) {
+                v0 += (((v1 shl 4) xor (v1 ushr 5)) + v1) xor ctrl[r][0]
+                v1 += (((v0 shl 4) xor (v0 ushr 5)) + v0) xor ctrl[r][1]
             }
-        } else {
-            for (i in 0 until ROUNDS) {
-                cs[i][0] = sum + key[((sum shr 11) and 3u).toInt()]
-                sum += DELTA
-                cs[i][1] = sum + key[(sum and 3u).toInt()]
-            }
+
+            // write back little-endian
+            out[i]   = (v0 and 0xFF).toByte()
+            out[i+1] = ((v0 ushr 8) and 0xFF).toByte()
+            out[i+2] = ((v0 ushr 16) and 0xFF).toByte()
+            out[i+3] = ((v0 ushr 24) and 0xFF).toByte()
+            out[i+4] = (v1 and 0xFF).toByte()
+            out[i+5] = ((v1 ushr 8) and 0xFF).toByte()
+            out[i+6] = ((v1 ushr 16) and 0xFF).toByte()
+            out[i+7] = ((v1 ushr 24) and 0xFF).toByte()
+
+            i += 8
         }
-
-        var pos = 0
-        while (pos < buffer.size) {
-            var v0 = loadUIntLE(buffer, pos)
-            var v1 = loadUIntLE(buffer, pos + 4)
-
-            if (encrypt) {
-                for (i in 0 until ROUNDS) {
-                    v0 += (((v1 shl 4) xor (v1 shr 5)) + v1) xor cs[i][0]
-                    v1 += (((v0 shl 4) xor (v0 shr 5)) + v0) xor cs[i][1]
-                }
-            } else {
-                for (i in 0 until ROUNDS) {
-                    v1 -= (((v0 shl 4) xor (v0 shr 5)) + v0) xor cs[i][0]
-                    v0 -= (((v1 shl 4) xor (v1 shr 5)) + v1) xor cs[i][1]
-                }
-            }
-
-            storeUIntLE(buffer, pos, v0)
-            storeUIntLE(buffer, pos + 4, v1)
-            pos += 8
-        }
-    }
-
-    private fun loadUIntLE(buf: ByteArray, pos: Int): UInt =
-        (buf[pos + 0].toUInt() and 0xFFu) or
-                ((buf[pos + 1].toUInt() and 0xFFu) shl 8) or
-                ((buf[pos + 2].toUInt() and 0xFFu) shl 16) or
-                ((buf[pos + 3].toUInt() and 0xFFu) shl 24)
-
-    private fun storeUIntLE(buf: ByteArray, pos: Int, value: UInt) {
-        buf[pos + 0] = (value and 0xFFu).toByte()
-        buf[pos + 1] = ((value shr 8) and 0xFFu).toByte()
-        buf[pos + 2] = ((value shr 16) and 0xFFu).toByte()
-        buf[pos + 3] = ((value shr 24) and 0xFFu).toByte()
+        return out
     }
 }

@@ -3,6 +3,12 @@ package org.example
 
 import ChecksumMethod
 import adlerChecksum
+import org.bouncycastle.jce.provider.BouncyCastleProvider
+import java.io.BufferedReader
+import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
+import java.io.File
+import java.io.StringReader
 import java.net.InetSocketAddress
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -10,35 +16,28 @@ import java.nio.channels.SelectionKey
 import java.nio.channels.Selector
 import java.nio.channels.ServerSocketChannel
 import java.nio.channels.SocketChannel
+import java.security.KeyFactory
+import java.security.PrivateKey
+import java.security.spec.PKCS8EncodedKeySpec
+import java.security.spec.RSAPrivateCrtKeySpec
+import java.security.spec.X509EncodedKeySpec
+import java.util.Base64
 import java.util.concurrent.Executors
-import java.util.zip.Adler32
+import java.security.Security
+import kotlin.math.ceil
 import kotlin.math.pow
-import kotlin.random.Random
 
-// ---------------- Updated RsaDecryptor using CustomRSA ----------------
-class RsaDecryptor(private val customRSA: CustomRSA) {
-    // RSA block size is always 128 bytes (1024 bits) to match C++ implementation
-    private val blockSize = 128
-
-    /** Return modulus block size in bytes (always 128 for this implementation) */
-    fun blockSizeBytes(): Int = blockSize
-
-    /** Decrypt exactly 128 bytes using custom RSA implementation */
-    fun decryptBlock(encrypted: ByteArray): ByteArray {
-        require(encrypted.size >= blockSize) { "Encrypted block must be at least $blockSize bytes" }
-
-        val block = encrypted.copyOf(blockSize)
-        customRSA.decrypt(block)
-        return block
-    }
-}
 
 // ---------------- NetworkBuffer (unchanged) ----------------
 class NetworkBuffer(private val buf: ByteArray) {
+    fun getBackingArray(): ByteArray = buf
     private val bb: ByteBuffer = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
     fun remaining(): Int = bb.remaining()
     fun position(): Int = bb.position()
-    fun setPosition(p: Int) { bb.position(p) }
+    fun setPosition(p: Int) {
+        bb.position(p)
+    }
+
     fun getByte(): Int = bb.get().toInt() and 0xFF
     fun getShort(): Int = bb.short.toInt() and 0xFFFF
     fun getInt(): Int = bb.int
@@ -52,51 +51,98 @@ class NetworkBuffer(private val buf: ByteArray) {
         bb.get(out)
         return out
     }
+
     fun putBytesAt(pos: Int, data: ByteArray) {
         val old = bb.position()
         bb.position(pos)
         bb.put(data)
         bb.position(old)
     }
+
     fun readTibiaString(): String {
         if (remaining() < 2) return ""
         val len = getU16()
         val bytes = getBytes(len)
         return String(bytes, Charsets.UTF_8)
     }
+
     fun asArray(): ByteArray = bb.array()
 }
 
 // ---------------- GameProtocol (unchanged) ----------------
-class GameProtocol(private val rsaDecryptor: RsaDecryptor) {
+class GameProtocol() {
     /**
      * Decrypts next RSA block (128 bytes) in place and returns true iff first decrypted byte == 0.
      */
-    fun rsaDecryptInPlace(nb: NetworkBuffer): Boolean {
-        val blockSize = rsaDecryptor.blockSizeBytes()
-        if (nb.remaining() < blockSize) return false
-        val start = nb.position()
-        val encrypted = nb.getBytes(blockSize)
-        val decrypted = rsaDecryptor.decryptBlock(encrypted)
-        nb.putBytesAt(start, decrypted)
-        nb.setPosition(start)
-        val first = nb.getByte()
-        return first == 0
+
+    val RSA_PRIVATE_KEY: PrivateKey by lazy {
+        // Read PEM text into one string
+        val RSA_FILE_CONTENT: String =
+            File("./key.pem").readText(Charsets.UTF_8)
+        // Remove PEM headers/footers
+        val base64Data = BufferedReader(StringReader(RSA_FILE_CONTENT))
+            .readLines()
+            .filterNot { it.contains("BEGIN") || it.contains("END") }
+            .joinToString("")
+            .replace("\\s".toRegex(), "")
+
+        val bytes = Base64.getDecoder().decode(base64Data)
+
+        val seq = org.bouncycastle.asn1.ASN1Sequence.getInstance(bytes)
+        val key = org.bouncycastle.asn1.pkcs.RSAPrivateKey.getInstance(seq)
+
+        val spec = RSAPrivateCrtKeySpec(
+            key.modulus,
+            key.publicExponent,
+            key.privateExponent,
+            key.prime1,
+            key.prime2,
+            key.exponent1,
+            key.exponent2,
+            key.coefficient
+        )
+
+        KeyFactory.getInstance("RSA").generatePrivate(spec)
     }
 
+    // Usage in your NetworkBuffer code:
+    fun rsaDecryptInPlace(nb: NetworkBuffer): Boolean {
+        if (nb.remaining() < 128) {
+            return false
+        }
+
+        val rsa = RSA.getInstance()
+        val pos = nb.position()
+
+        // Decrypt in place
+        rsa.decrypt(nb.getBackingArray(), pos)
+
+        val firstByte = nb.getByte()
+        // Check if first decrypted byte is 0
+        return firstByte.toByte() == 0.toByte()
+    }
+
+    val skipBytes = 1
+
+    @OptIn(ExperimentalUnsignedTypes::class)
     fun parseGameLoginPacket(packetBytes: ByteArray): ParsedLogin? {
-        val nb = NetworkBuffer(packetBytes)
+        var nb = NetworkBuffer(packetBytes)
         try {
             if (nb.remaining() < 2 + 2 + 4) {
                 println("Packet too short")
                 return null
             }
-            val randomTrash = nb.getU32()
+            val randomTrash1 = nb.getU8()
             val randomTrash2 = nb.getU8()
+            val randomTrash3 = nb.getU8()
+            val randomTrash4 = nb.getU8()
+            val randomTrash5 = nb.getU8()
+            val randomTrash6 = nb.getU8()
+
             val os = nb.getU16()
             val version = nb.getU16()
-            val oldProtocol = version <= 1100
             val clientVersion = nb.getU32()
+            val oldProtocol = version <= 1100
             println("OS=$os version=$version oldProtocol=$oldProtocol clientVersion=$clientVersion")
 
             var versionString: String? = null
@@ -119,10 +165,14 @@ class GameProtocol(private val rsaDecryptor: RsaDecryptor) {
             println("preview=$preview")
 
             // RSA decrypt
-            val ok = rsaDecryptInPlace(nb)
+            //val ok = rsaDecryptInPlace(nb)
+            val decrypted = RSA_2.decrypt(nb.getBytes(minOf(nb.remaining(), 128)), RSA_PRIVATE_KEY)
+            nb = NetworkBuffer(decrypted)
+            val firstByte = nb.getByte()
+            val ok = firstByte == 0x00
             if (!ok) {
                 println("RSA decrypt failed (first byte != 0)")
-                return null
+                //return null
             }
             println("RSA decrypted OK")
 
@@ -135,7 +185,8 @@ class GameProtocol(private val rsaDecryptor: RsaDecryptor) {
                 println("XTEA: ${arr.joinToString { "0x${it.toString(16)}" }}")
             }
 
-            val gm = if (nb.remaining() >= 1) nb.getByte() != 0 else false
+            val gmByte = nb.getByte()
+            val gm = if (nb.remaining() >= 1) gmByte != 0 else false
             println("GM=$gm")
 
             val session = nb.readTibiaString()
@@ -169,7 +220,7 @@ class GameProtocol(private val rsaDecryptor: RsaDecryptor) {
             return ParsedLogin(
                 os, version, oldProtocol, clientVersion,
                 versionString, assetHash, datRevision, preview,
-                xtea, gm, acct, pass, charName, stamp, rand
+                xtea!!.toIntArray(), gm, acct, pass, charName, stamp, rand
             )
 
         } catch (ex: Exception) {
@@ -189,7 +240,7 @@ data class ParsedLogin(
     val assetHash: String?,
     val datRevision: Int?,
     val previewState: Int,
-    val xteaKey: UIntArray?,
+    val xteaKey: IntArray?,
     val isGameMaster: Boolean,
     val accountDescriptor: String,
     val password: String,
@@ -202,18 +253,13 @@ data class ParsedLogin(
 // ---------------- Updated GameServer using CustomRSA ----------------
 class GameServer(private val port: Int, private val pemPath: String) {
     private lateinit var protocol: GameProtocol
-    private lateinit var rsaDecryptor: RsaDecryptor
-    private lateinit var customRSA: CustomRSA
     private var packetSequence = 0
 
     private var serverSequenceNumber: Int = 0
     fun start() {
         println("Initializing Custom RSA")
-        customRSA = CustomRSA()
-        customRSA.start(pemPath)
 
-        rsaDecryptor = RsaDecryptor(customRSA)
-        protocol = GameProtocol(rsaDecryptor)
+        protocol = GameProtocol()
 
         val server = ServerSocketChannel.open()
         server.bind(InetSocketAddress(port))
@@ -278,20 +324,18 @@ class GameServer(private val port: Int, private val pemPath: String) {
     private fun handleClient(client: SocketChannel) {
         try {
             val sock = client.socket()
-            /*
+            sendChallenge(client)
             val handshake = readHandshake(client)
             println("Handshake from ${sock.remoteSocketAddress}: '$handshake'")
-             */
             val packet = readPacket(client) ?: run {
                 println("Failed reading packet")
                 client.close(); return
             }
-            sendChallenge(client)
             println("Received packet ${packet.size} bytes")
             val parsed = protocol.parseGameLoginPacket(packet)
             if (parsed != null) {
-                sendAddCreature(client, parsed.xteaKey)
-                 //sendSrakenPierdaken(client, parsed.xteaKey)
+                //sendAddCreature(client, parsed.xteaKey)
+                sendSrakenPierdaken(client, parsed.xteaKey)
                 println("Parsed login: account='${parsed.accountDescriptor}' char='${parsed.characterName}'")
             } else {
                 println("Failed to parse login packet")
@@ -309,7 +353,7 @@ class GameServer(private val port: Int, private val pemPath: String) {
         while (true) {
             buf.clear()
             val r = client.read(buf)
-            if (r <= 0) break
+            if (r < 0) break
             buf.flip()
             val b = buf.get()
             if (b == '\n'.toByte()) break
@@ -321,37 +365,53 @@ class GameServer(private val port: Int, private val pemPath: String) {
 
     private fun sendChallenge(client: SocketChannel) {
         try {
+            val p = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN)
+            p.put(0x01u.toByte())
+            p.put(0x00u.toByte())
+
+            p.put(0x11u.toByte())
+            p.put(0x02u.toByte())
+            p.put(0xF1u.toByte())
+            p.put(0x05u.toByte())
+
+            p.put(0x01u.toByte())
+            p.put(0x1fu.toByte())
+
             val ts = (System.currentTimeMillis() / 1000).toInt()
-            val rand = Random.nextInt(0, 256).toByte()
-            val p = ByteBuffer.allocate(14).order(ByteOrder.LITTLE_ENDIAN)
-            p.put(0x0c.toByte()); p.put(0x00.toByte()); p.put(0xc0.toByte()); p.put(0x02.toByte())
-            p.put(0xd3.toByte()); p.put(0x09.toByte()); p.put(0x06.toByte()); p.put(0x00.toByte())
-            p.put(0x1f.toByte()); p.put(0xbc.toByte()); p.put(0x97.toByte()); p.put(0x95.toByte()); p.put(0x68.toByte())
-            p.rewind()
+            p.putInt(ts)
+
+            p.put(0x92u.toByte())
+            p.put(0x71u.toByte())
+            p.flip()
+
             client.write(p)
-            println("Sent challenge ts=$ts rand=${rand.toInt() and 0xFF}")
+            println("Sent challenge")
         } catch (e: Exception) {
             println("Failed challenge: ${e.message}")
         }
     }
+
     private val SCALING_BASE = 10.0
 
     private fun putDoubleWithPrecision(buffer: ByteBuffer, value: Double, precision: Byte = 0x03) {
         buffer.put(precision)
         val scaled = value * SCALING_BASE.pow(precision.toInt())
-        buffer.putInt(scaled.toInt()+0x7fffffff) // ✅ fix: putInt takes Int, not UInt
+        buffer.putInt(scaled.toInt() + 0x7fffffff) // ✅ fix: putInt takes Int, not UInt
     }
-    private fun putCipString(buffer: ByteBuffer, value: String){
+
+    private fun putCipString(buffer: ByteBuffer, value: String) {
         val stringAsByteArray = value.toByteArray()
         buffer.put(stringAsByteArray.size.toByte())
         buffer.put(0x00)
         buffer.put(stringAsByteArray)
     }
-    private fun appendPosition(buffer: ByteBuffer, pos: Position){
+
+    private fun appendPosition(buffer: ByteBuffer, pos: Position) {
         buffer.putShort(pos.x)
         buffer.putShort(pos.y)
         buffer.put(pos.z)
     }
+
     private fun appendAllowBugReport(inner: ByteBuffer, allow: Boolean) {
         // 0x1A + 0x00 (allow) / 0x01 (disable)
         inner.put(0x1A)
@@ -372,8 +432,9 @@ class GameServer(private val port: Int, private val pemPath: String) {
         inner.put((secondsSinceMidnight / 60).toByte())
         inner.put((secondsSinceMidnight % 60).toByte())
     }
-    private fun appendFloorDescription(inner: ByteBuffer, skip: Int, pos: Position):Int {
-    //pos for mock only sending player pos
+
+    private fun appendFloorDescription(inner: ByteBuffer, skip: Int, pos: Position): Int {
+        //pos for mock only sending player pos
         var skip = skip
         //appendTileDescription(inner)
 
@@ -388,23 +449,25 @@ class GameServer(private val port: Int, private val pemPath: String) {
         inner.put(0x00)
     }
 
-    private fun appendMapDescription(inner: ByteBuffer, pos: Position){
+    private fun appendMapDescription(inner: ByteBuffer, pos: Position) {
         inner.put(0x64)
         appendPosition(inner, pos)
 
         //TODO
         var skip = appendFloorDescription(inner, -1, pos)
-        if (skip >= 0){
+        if (skip >= 0) {
             inner.put(skip.toByte())
             inner.put(0xFF.toByte())
         }
     }
+
     private fun nextSequenceNumber(): Int {
         val seq = packetSequence
         packetSequence = (packetSequence + 1) and 0xFFFF // wrap for U16
         return seq
     }
-    private  fun writeCreaturePacket(inner: ByteBuffer){
+
+    private fun writeCreaturePacket(inner: ByteBuffer) {
         val storeImagesUrl = "http://127.0.0.1/images/store/"
 
         inner.put(0x17)
@@ -425,7 +488,7 @@ class GameServer(private val port: Int, private val pemPath: String) {
         appendPendingStateEntered(inner)
         appendEnterWorld(inner)
         val pos = Position(17568, 17406, 7)
-        appendMapDescription(inner,pos)
+        appendMapDescription(inner, pos)
         //appendMagicEffect(inner, pos)
         inner.put(0x75.toByte())
         inner.put(0xff.toByte())
@@ -491,7 +554,8 @@ class GameServer(private val port: Int, private val pemPath: String) {
         inner.put(0x00.toByte())
     }
 
-    private fun sendAddCreature(client: SocketChannel, xteaKey: UIntArray?) {
+    /*
+    private fun sendAddCreature(client: SocketChannel, xteaKey: IntArray?) {
         // 1. Write message content
         val body = ByteBuffer.allocate(1024).order(ByteOrder.LITTLE_ENDIAN)
         writeCreaturePacket(body)
@@ -499,16 +563,16 @@ class GameServer(private val port: Int, private val pemPath: String) {
 
         // 2. PADDING (writePaddingAmount)
         val paddingCount = (8 - ((bodyBytes.size + 1) % 8)) % 8
-        val padded = ByteArray(bodyBytes.size + paddingCount + 1)
+        val padded = UByteArray(bodyBytes.size + paddingCount + 1)
         System.arraycopy(bodyBytes, 0, padded, 0, bodyBytes.size)
         // pad bytes are zero
-        padded[padded.size - 1] = paddingCount.toByte() // last byte = pad count
+        padded[padded.size - 1] = paddingCount.toUByte() // last byte = pad count
 
         // 3. XTEA encrypt (if key provided)
         val encrypted = if (xteaKey != null) Xtea.encrypt(padded, xteaKey) else return
 
         // 4. addCryptoHeader (CHECKSUM_METHOD_SEQUENCE)
-        val blockCount = encrypted.paddingSize / 8
+        val blockCount = encrypted.size / 8
         var seq = nextSequenceNumber()
         if (seq >= 0x7FFFFFFF) seq = 0
         val header = ByteBuffer.allocate(2 + 4).order(ByteOrder.LITTLE_ENDIAN)
@@ -517,48 +581,85 @@ class GameServer(private val port: Int, private val pemPath: String) {
         header.flip()
 
         // 5. Combine header + encrypted payload
-        val finalPacket = ByteBuffer.allocate(header.remaining() + encrypted.data.size)
+        val finalPacket = ByteBuffer.allocate(header.remaining() + encrypted.size)
         finalPacket.put(header)
-        finalPacket.put(encrypted.data)
+        finalPacket.put(encrypted.asByteArray())
         finalPacket.flip()
 
         // 6. send
         client.write(finalPacket)
     }
+     */
+    private fun sendSrakenPierdaken(client: SocketChannel, xteaKey: IntArray?) {
+        val messageStr = "You may only login with 1 character\nof your account at the same time."
+        val plain = messageStr.toByteArray()
 
-
-    private fun sendSrakenPierdaken(client: SocketChannel, xteaKey: UIntArray?) {
-        try {
-            val messageStr = "Sraken pierdaken"
-            val message = messageStr.toByteArray()
-
-            val inner = ByteBuffer
-                .allocate(2 + 3 + message.size)
-                .order(ByteOrder.LITTLE_ENDIAN)
-
-            // inner length (will be encrypted) = 3 + message.size
-            inner.putShort((3 + message.size).toShort())
-
-            inner.put(0x14)
-            putCipString(inner, messageStr)
-
-            val innerBytes = inner.array()
-
-            // 1) Encrypt inner with XTEA if key exists
-            val encrypted = if (xteaKey != null) Xtea.encrypt(innerBytes, xteaKey) else return
-
-            // 2) Wrap with outer header (pick your checksum mode)
-            val finalPacket = addCryptoHeader(encrypted.data, ChecksumMethod.SEQUENCE)
-
-            client.write(ByteBuffer.wrap(finalPacket))
-            println("Sent TreleMorele (Checksum=${ChecksumMethod.SEQUENCE}, XTEA=${xteaKey != null})")
-        } catch (e: Exception) {
-            println("sendTreleMorele failed :( : ${e.message}")
+        if (xteaKey == null) {
+            return
         }
+
+        // 1) Build inner payload: header (1 byte) + payload
+        val buf = ByteArrayOutputStream()
+        buf.write(0x07) // header byte
+        buf.write(0x14) // header byte
+        buf.write(messageStr.length)
+        buf.write(0x00)
+        buf.write(plain) // payload
+
+        // 2) Calculate padding amount
+        val currentLength = buf.size()
+        val paddingAmount = (currentLength - 2) % 8
+
+        // 3) Add padding bytes (0x33)
+        repeat(paddingAmount) { buf.write(0x33) }
+
+        // 4) Add padding amount as last byte (before encryption)
+        var innerMsg = buf.toByteArray()
+
+        // 5) XTEA encrypt the entire buffer
+        innerMsg = Xtea.encrypt(innerMsg, xteaKey)
+
+        // 6) Build crypto header using add_header logic (prepending in reverse)
+        val sequence = ++serverSequenceNumber
+        if (serverSequenceNumber >= 0x7FFFFFFF) serverSequenceNumber = 0
+
+        // Check if compression would be used (length >= 128)
+        val sendMessageChecksum = if (innerMsg.size >= 128) {
+            (1u shl 31) or sequence.toUInt()
+        } else {
+            sequence.toUInt()
+        }
+
+        // messageLength = encryptedLength / 8
+        val messageLength = (innerMsg.size / 8).toUShort()
+
+        // Build final packet by prepending headers in reverse order
+        val out = ByteArrayOutputStream()
+
+        // First write the encrypted message
+        out.write(innerMsg)
+
+        // Now prepend headers using a helper to write in little-endian
+        val finalBuffer = ByteArrayOutputStream()
+
+        // Add checksum (4 bytes, little-endian) - prepended last, so appears first
+        finalBuffer.write(0x0A)
+        finalBuffer.write(0x00)
+        finalBuffer.write(0x01)
+        finalBuffer.write(0x00)
+
+        // Add message length (2 bytes, little-endian) - prepended second, so appears after checksum
+        finalBuffer.write(0x00)
+        finalBuffer.write(0x00)
+
+        // Add encrypted message
+        finalBuffer.write(innerMsg)
+
+        client.write(ByteBuffer.wrap(finalBuffer.toByteArray()))
     }
 
     private fun readPacket(client: SocketChannel): ByteArray? {
-        val header = ByteBuffer.allocate(2).order(ByteOrder.LITTLE_ENDIAN)
+        val header = ByteBuffer.allocate(2)
         var read = 0
         while (read < 2) {
             val r = client.read(header)
@@ -570,7 +671,7 @@ class GameServer(private val port: Int, private val pemPath: String) {
         if (size <= 0 || size > 65535) {
             println("Invalid size: $size"); return null
         }
-        val payload = ByteBuffer.allocate(167)
+        val payload = ByteBuffer.allocate(1024)
         var total = 0
         while (total < size) {
             val r = client.read(payload)
@@ -583,6 +684,8 @@ class GameServer(private val port: Int, private val pemPath: String) {
 
 // ---------------- Main ----------------
 fun main() {
+    Security.addProvider(BouncyCastleProvider())
+
     val pem = "key.pem"
     val server = GameServer(7172, pem)
     server.start()
