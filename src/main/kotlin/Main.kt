@@ -122,6 +122,7 @@ class GameProtocol() {
         return firstByte.toByte() == 0.toByte()
     }
 
+    val test = 1
     val skipBytes = 1
 
     @OptIn(ExperimentalUnsignedTypes::class)
