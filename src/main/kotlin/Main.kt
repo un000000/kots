@@ -316,7 +316,6 @@ class GameServer(private val port: Int, private val pemPath: String) {
             if (parsed != null) {
                 val session = GameClientSession(client, parsed.xteaKey)
 
-                //sendAddCreature(client, parsed.xteaKey)
                 session.sendAddCreature()
 
                 session.disconnectClient("You may only login with 1 character\nof your account at the same time.")
