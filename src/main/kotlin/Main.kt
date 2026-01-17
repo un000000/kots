@@ -114,7 +114,7 @@ class GameProtocol() {
             val randomTrash3 = nb.get8()
             val randomTrash4 = nb.get8()
             val randomTrash5 = nb.get8()
-            //val randomTrash6 = nb.getU8()
+            val randomTrash6 = nb.get8()
 
             val os = nb.get16()
             val version = nb.get16()
@@ -317,8 +317,9 @@ class GameServer(private val port: Int, private val pemPath: String) {
                 val session = GameClientSession(client, parsed.xteaKey)
 
                 //sendAddCreature(client, parsed.xteaKey)
-                session.disconnectClient("You may only login with 1 character\nof your account at the same time.")
+                session.sendAddCreature()
 
+                session.disconnectClient("You may only login with 1 character\nof your account at the same time.")
                 println("Parsed login: account='${parsed.accountDescriptor}' char='${parsed.characterName}'")
             } else {
                 println("Failed to parse login packet")
@@ -372,169 +373,6 @@ class GameServer(private val port: Int, private val pemPath: String) {
         } catch (e: Exception) {
             println("Failed challenge: ${e.message}")
         }
-    }
-
-    private val SCALING_BASE = 10.0
-
-    private fun putDoubleWithPrecision(buffer: ByteBuffer, value: Double, precision: Byte = 0x03) {
-        buffer.put(precision)
-        val scaled = value * SCALING_BASE.pow(precision.toInt())
-        buffer.putInt(scaled.toInt() + 0x7fffffff) // ✅ fix: putInt takes Int, not UInt
-    }
-
-    private fun putCipString(buffer: ByteBuffer, value: String) {
-        val stringAsByteArray = value.toByteArray()
-        buffer.put(stringAsByteArray.size.toByte())
-        buffer.put(0x00)
-        buffer.put(stringAsByteArray)
-    }
-
-    private fun appendPosition(buffer: ByteBuffer, pos: Position) {
-        buffer.putShort(pos.x)
-        buffer.putShort(pos.y)
-        buffer.put(pos.z)
-    }
-
-    private fun appendAllowBugReport(inner: ByteBuffer, allow: Boolean) {
-        // 0x1A + 0x00 (allow) / 0x01 (disable)
-        inner.put(0x1A)
-        inner.put(if (allow) 0x00 else 0x01)
-        // Ref: ProtocolGame::sendAllowBugReport. :contentReference[oaicite:34]{index=34}
-    }
-
-    private fun appendPendingStateEntered(inner: ByteBuffer) {
-        inner.put(0x0A) // Ref: sendPendingStateEntered. :contentReference[oaicite:35]{index=35}
-    }
-
-    private fun appendEnterWorld(inner: ByteBuffer) {
-        inner.put(0x0F) // Ref: sendEnterWorld. :contentReference[oaicite:36]{index=36}
-    }
-
-    private fun appendTibiaTime(inner: ByteBuffer, secondsSinceMidnight: Int) {
-        inner.put(0xEF.toByte()) // Ref: sendTibiaTime. :contentReference[oaicite:37]{index=37}
-        inner.put((secondsSinceMidnight / 60).toByte())
-        inner.put((secondsSinceMidnight % 60).toByte())
-    }
-
-    private fun appendFloorDescription(inner: ByteBuffer, skip: Int, pos: Position): Int {
-        //pos for mock only sending player pos
-        var skip = skip
-        //appendTileDescription(inner)
-
-        return skip
-    }
-
-    private fun appendMagicEffect(inner: ByteBuffer, pos: Position) {
-        inner.put(0x83.toByte())
-        appendPosition(inner, pos)
-        inner.put(0x03)
-        inner.putShort(11)
-        inner.put(0x00)
-    }
-
-    private fun appendMapDescription(inner: ByteBuffer, pos: Position) {
-        inner.put(0x64)
-        appendPosition(inner, pos)
-
-        //TODO
-        var skip = appendFloorDescription(inner, -1, pos)
-        if (skip >= 0) {
-            inner.put(skip.toByte())
-            inner.put(0xFF.toByte())
-        }
-    }
-
-    private fun nextSequenceNumber(): Int {
-        val seq = packetSequence
-        packetSequence = (packetSequence + 1) and 0xFFFF // wrap for U16
-        return seq
-    }
-
-    private fun writeCreaturePacket(inner: ByteBuffer) {
-        val storeImagesUrl = "http://127.0.0.1/images/store/"
-
-        inner.put(0x17)
-        inner.putInt(268435464)
-        inner.putShort(50)
-        putDoubleWithPrecision(inner, 857.36)
-        putDoubleWithPrecision(inner, 261.29)
-        putDoubleWithPrecision(inner, -4795.01)
-        inner.put(0x00)
-        inner.put(0x00)
-        putCipString(inner, storeImagesUrl)
-
-        inner.putShort(25)
-        inner.put(0x00)
-
-        appendAllowBugReport(inner, true)
-        appendTibiaTime(inner, 0)
-        appendPendingStateEntered(inner)
-        appendEnterWorld(inner)
-        val pos = Position(17568, 17406, 7)
-        appendMapDescription(inner, pos)
-        //appendMagicEffect(inner, pos)
-        inner.put(0x75.toByte())
-        inner.put(0xff.toByte())
-        inner.put(0xa3.toByte())
-        inner.put(0x11.toByte())
-        inner.put(0x61.toByte())
-        inner.put(0x00.toByte())
-        inner.put(0x00.toByte())
-        inner.put(0x00.toByte())
-        inner.put(0x00.toByte())
-        inner.put(0x00.toByte())
-        inner.put(0x06.toByte())
-        inner.put(0x00.toByte())
-        inner.put(0x00.toByte())
-        inner.put(0x10.toByte())
-        inner.put(0x00.toByte())
-        inner.put(0x03.toByte())
-        inner.put(0x00.toByte())
-        inner.put(0x47.toByte())
-        inner.put(0x4f.toByte())
-        inner.put(0x44.toByte())
-        inner.put(0x64.toByte())
-        inner.put(0x02.toByte())
-        inner.put(0x88.toByte())
-        inner.put(0x00.toByte())
-        inner.put(0x5f.toByte())
-        inner.put(0x71.toByte())
-        inner.put(0x27.toByte())
-        inner.put(0x73.toByte())
-        inner.put(0x00.toByte())
-        inner.put(0x00.toByte())
-        inner.put(0x00.toByte())
-        inner.put(0xff.toByte())
-        inner.put(0xd7.toByte())
-        inner.put(0xff.toByte())
-        inner.put(0xff.toByte())
-        inner.put(0x00.toByte())
-        inner.put(0x00.toByte())
-        inner.put(0x00.toByte())
-        inner.put(0x00.toByte())
-        inner.put(0x00.toByte())
-        inner.put(0x00.toByte())
-        inner.put(0x00.toByte())
-        inner.put(0xff.toByte())
-        inner.put(0x00.toByte())
-        inner.put(0x00.toByte())
-        inner.put(0xff.toByte())
-        inner.put(0xff.toByte())
-        inner.put(0xff.toByte())
-        inner.put(0xff.toByte())
-        inner.put(0xff.toByte())
-        inner.put(0xff.toByte())
-        inner.put(0xff.toByte())
-        inner.put(0xff.toByte())
-        inner.put(0xff.toByte())
-        inner.put(0xff.toByte())
-        inner.put(0xff.toByte())
-        inner.put(0xff.toByte())
-        inner.put(0xff.toByte())
-        inner.put(0xff.toByte())
-        inner.put(0x69.toByte())
-        inner.put(0xff.toByte())
-        inner.put(0x00.toByte())
     }
 
     /*

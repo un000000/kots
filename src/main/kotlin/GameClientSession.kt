@@ -2,20 +2,24 @@ import java.nio.ByteBuffer
 import java.nio.channels.SocketChannel
 
 class GameClientSession(
-    private val client: SocketChannel,
-    private val xteaKey: IntArray
+    private val client: SocketChannel, private val xteaKey: IntArray
 ) {
     private var serverSequenceNumber = 0
 
-    fun disconnectClient(
-        message: String = "disconnectClientTextPlaceholder"
-    ) {
+    fun disconnectClient(message: String = "disconnectClientTextPlaceholder") {
         val builder = GameMessageBuilder(
-            sequenceProvider = { nextSequence() },
-            xteaKey = xteaKey
+            sequenceProvider = { nextSequence() }, xteaKey = xteaKey
         )
 
         val msg = builder.buildDisconnectPacket(message)
+        client.write(ByteBuffer.wrap(msg))
+    }
+    fun sendAddCreature() {
+        val builder = GameMessageBuilder(
+            sequenceProvider = { nextSequence() }, xteaKey = xteaKey
+        )
+
+        val msg = builder.buildSendAddCreaturePacket()
         client.write(ByteBuffer.wrap(msg))
     }
 
