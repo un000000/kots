@@ -4,7 +4,14 @@ package org.example
 import ChecksumMethod
 import GameClientSession
 import adlerChecksum
+import models.AccountToken
+import models.AccountTokenTable
+import models.Player
+import models.PlayersTable
 import org.bouncycastle.jce.provider.BouncyCastleProvider
+import org.jetbrains.exposed.sql.and
+import org.jetbrains.exposed.sql.transactions.transaction
+import plugins.configureDatabases
 import java.io.BufferedReader
 import java.io.File
 import java.io.StringReader
@@ -21,6 +28,9 @@ import java.security.spec.RSAPrivateCrtKeySpec
 import java.util.Base64
 import java.util.concurrent.Executors
 import java.security.Security
+import java.time.LocalDateTime
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 import kotlin.math.pow
 
 
@@ -57,7 +67,7 @@ class NetworkBuffer(private val buf: ByteArray) {
 
     fun readTibiaString(): String {
         if (remaining() < 2) return ""
-        val len = get16()
+        var len = get16()
         val bytes = getBytes(len)
         return String(bytes, Charsets.UTF_8)
     }
@@ -101,6 +111,23 @@ class GameProtocol() {
         KeyFactory.getInstance("RSA").generatePrivate(spec)
     }
 
+    fun generateHMACSHA256TRIMMED(data: String, secret: String): String {
+        val hmacSHA256 = Mac.getInstance("HmacSHA256")
+        val secretKeySpec = SecretKeySpec(secret.toByteArray(), "HmacSHA256")
+        hmacSHA256.init(secretKeySpec)
+        val hash = hmacSHA256.doFinal(data.toByteArray())
+        val hmac = hash.joinToString("") { String.format("%02x", it) }
+        val hmacTrimmed = hmac.substring(0, hmac.length - 10)
+        return hmacTrimmed
+    }
+    fun fastEquals(a: String, b: String): Boolean {
+        if (a.length != b.length) return false
+        var result = 0
+        for (i in a.indices) {
+            result = result or (a[i].code xor b[i].code)
+        }
+        return result == 0
+    }
     @OptIn(ExperimentalUnsignedTypes::class)
     fun parseGameLoginPacket(packetBytes: ByteArray): ParsedLogin? {
         var nb = NetworkBuffer(packetBytes)
@@ -161,7 +188,7 @@ class GameProtocol() {
                 xtea = arr
                 println("XTEA: ${arr.joinToString { "0x${it.toString(16)}" }}")
             }
-            if (xtea == null){
+            if (xtea == null) {
                 return null
             }
 
@@ -169,12 +196,25 @@ class GameProtocol() {
             val gm = if (nb.remaining() >= 1) gmByte != 0 else false
             println("GM=$gm")
 
-            val session = nb.readTibiaString()
-            println("sessionRaw='$session'")
-            val (acct, pass) = if (session.contains('\n')) {
-                val idx = session.indexOf('\n')
-                session.substring(0, idx) to session.substring(idx + 1)
-            } else session to ""
+            val sessionRaw = nb.readTibiaString()
+            println("sessionRaw='$sessionRaw'")
+
+            val parts = listOf(sessionRaw.substring(0,32), sessionRaw.substring(32, sessionRaw.length))
+            if (parts.size != 2) {
+                println("Invalid session format")
+                return null
+            }
+
+            val token = parts[0]
+            val clientHmac = parts[1]
+
+            // compute server-side HMAC
+            val serverHmac =
+                generateHMACSHA256TRIMMED(token, "2e8498c0487c5b77833bdb8df82d9db77e414fb4ca2da559aec70d83148b25d7")
+            if (!fastEquals(serverHmac, clientHmac)) {
+                println("Invalid HMAC")
+                return null
+            }
 
             // optional linux strings
             if (!oldProtocol && os == 0x0C) {
@@ -184,6 +224,40 @@ class GameProtocol() {
 
             val charName = nb.readTibiaString()
             println("charName='$charName'")
+
+            val (player, account, validToken) = transaction {
+                val player = Player.find { PlayersTable.name eq charName }.firstOrNull()
+
+                if (player == null) return@transaction Triple(null, null, null)
+
+                val account = player.account
+
+                val validToken = AccountToken.find {
+                    (AccountTokenTable.accountId eq account.id) and
+                            (AccountTokenTable.token eq token)
+                }.firstOrNull()
+
+                Triple(player, account, validToken)
+            }
+
+            // now check outside
+            if (player == null) {
+                println("Character not found")
+                return null
+            }
+            if (account == null) {
+                println("Character has no account")
+                return null
+            }
+            if (validToken == null) {
+                println("Token not found for account")
+                return null
+            }
+            val now = LocalDateTime.now()
+            if (validToken.expiresAt < now) {
+                println("Token expired")
+                return null
+            }
 
             var stamp = 0
             if (nb.remaining() >= 4) {
@@ -200,7 +274,7 @@ class GameProtocol() {
             return ParsedLogin(
                 os, version, oldProtocol, clientVersion,
                 versionString, assetHash, datRevision, preview,
-                xtea.toIntArray(), gm, acct, pass, charName, stamp, rand
+                xtea.toIntArray(), gm, charName, stamp, rand
             )
 
         } catch (ex: Exception) {
@@ -222,8 +296,8 @@ data class ParsedLogin(
     val previewState: Int,
     val xteaKey: IntArray,
     val isGameMaster: Boolean,
-    val accountDescriptor: String,
-    val password: String,
+    //val accountDescriptor: String,
+    //val password: String,
     val characterName: String,
     val timestamp: Int,
     val randomByte: Int
@@ -318,8 +392,8 @@ class GameServer(private val port: Int, private val pemPath: String) {
 
                 session.sendAddCreature()
 
-                session.disconnectClient("You may only login with 1 character\nof your account at the same time.")
-                println("Parsed login: account='${parsed.accountDescriptor}' char='${parsed.characterName}'")
+                //session.disconnectClient("You may only login with 1 character\nof your account at the same time.")
+                println("Parsed login: characterName='${parsed.characterName}'")
             } else {
                 println("Failed to parse login packet")
             }
@@ -436,6 +510,7 @@ class GameServer(private val port: Int, private val pemPath: String) {
 
 // ---------------- Main ----------------
 fun main() {
+    configureDatabases()
     Security.addProvider(BouncyCastleProvider())
 
     val pem = "key.pem"
