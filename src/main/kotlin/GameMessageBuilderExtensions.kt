@@ -1,12 +1,11 @@
 import org.example.Position
-import org.example.Xtea
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import kotlin.math.pow
 
 internal data class Tile(val groundId: Int)
 
-internal val validGroundIds = listOf(419, 420, 452, 453)
+internal val validGroundIds = listOf(419)
 
 internal fun generateDummyMap(center: Position, width: Int, height: Int): Array<Array<Tile?>> {
     // center tile always exists; neighbors randomly exist or are null
@@ -107,7 +106,7 @@ private fun appendFloorDescription(
                 }
                 s = 0
                 appendTileDescription(inner, tile)
-                if (w == 8 && h == 6){
+                if (w == 8 && h == 6) {
                     writeGodCreature(inner)
                 }
             } else {
@@ -134,7 +133,7 @@ internal fun appendMagicEffect(inner: ByteBuffer, pos: Position) {
 }
 
 internal fun appendWorldLight(inner: ByteBuffer) {
-    inner.put(0x82.toByte())
+    inner.put(0x80.toByte())
     inner.put(0xFF.toByte())
     inner.put(0x16.toByte())
 }
@@ -143,23 +142,25 @@ internal fun appendCreatureLight(inner: ByteBuffer, creatureId: Int) {
     inner.put(0x8D.toByte())
     inner.putIntLE(creatureId)
     inner.put(0x05.toByte())
-    inner.put(0x17.toByte())
+    inner.put(0x18.toByte())
 }
 
 private fun ByteBuffer.putIntLE(value: Int) {
-    put((value and 0xFF).toByte())
+    put(((value shr 0)  and 0xFF).toByte())
     put(((value shr 8) and 0xFF).toByte())
     put(((value shr 16) and 0xFF).toByte())
-    put(((value shr 32) and 0xFF).toByte())
+    put(((value shr 24) and 0xFF).toByte())
 }
 
+val viewportX = 8
+val viewportY = 6
 internal fun appendMapDescription(inner: ByteBuffer, pos: Position) {
     inner.put(0x64) // opcode
     appendPosition(inner, pos)
 
     // --- CONFIG: tiny viewport (7x7 like mini radar) ---
-    val width = 18
-    val height = 14
+    val width = (viewportX + 1) * 2
+    val height = (viewportY + 1) * 2
 
     // generate synthetic map
     val map = generateDummyMap(pos, width, height)
@@ -198,7 +199,7 @@ internal fun writeGodCreature(inner: ByteBuffer) {
     inner.put(0x4f.toByte()) //o
     inner.put(0x44.toByte()) //d
 
-    inner.put(0x64.toByte()) // currentHealth / maxhealth * 100
+    inner.put(0x63.toByte()) // currentHealth / maxhealth * 100
 
     inner.put(0x02.toByte()) // direction
 
@@ -212,7 +213,7 @@ internal fun writeGodCreature(inner: ByteBuffer) {
     inner.put(0x00.toByte()) // mount
     inner.put(0x00.toByte()) // mount
 
-    inner.put(0xff.toByte()) // light strength
+    inner.put(0xfa.toByte()) // light strength
     inner.put(0xd7.toByte()) // light color
 
     inner.put(0xff.toByte()) // step speed
@@ -226,7 +227,7 @@ internal fun writeGodCreature(inner: ByteBuffer) {
     inner.put(0x00.toByte()) // creatureType
     inner.put(0x00.toByte()) // vocation
     inner.put(0x00.toByte()) // speech bubble
-    inner.put(0xff.toByte()) // minimark map
+    inner.put(0xfb.toByte()) // minimark map
     inner.put(0x00.toByte()) // inspection type?
     inner.put(0x00.toByte()) // can walk through it
 }
@@ -236,7 +237,7 @@ internal fun writeCreaturePacket(inner: ByteBuffer) {
 
     inner.put(0x17)
     val creatureId = 268435464
-    inner.putInt(creatureId)
+    inner.putIntLE(creatureId)
     inner.putShort(50)
     putDoubleWithPrecision(inner, 857.36)
     putDoubleWithPrecision(inner, 261.29)
@@ -254,9 +255,9 @@ internal fun writeCreaturePacket(inner: ByteBuffer) {
     appendEnterWorld(inner)
     val pos = Position(17568, 17406, 7)
 
-    appendWorldLight(inner)
-    //appendCreatureLight(inner, creatureId)
     appendMapDescription(inner, pos)
+    appendWorldLight(inner)
+    appendCreatureLight(inner, creatureId)
 
     //appendMagicEffect(inner, pos)
 
@@ -284,6 +285,5 @@ internal fun writeCreaturePacket(inner: ByteBuffer) {
     inner.put(0xff.toByte())
     inner.put(0x00.toByte())
      */
-
 }
 
