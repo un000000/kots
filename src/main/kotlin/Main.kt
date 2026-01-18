@@ -33,8 +33,12 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 import kotlin.math.pow
 
+sealed class ParsedLoginResult {
+    data class Success(val login: ParsedLogin) : ParsedLoginResult()
+    data class FailureBeforeXtea(val reason: String) : ParsedLoginResult()
+    data class FailureAfterXtea(val reason: String, val xtea: IntArray) : ParsedLoginResult()
+}
 
-// ---------------- NetworkBuffer (unchanged) ----------------
 class NetworkBuffer(private val buf: ByteArray) {
     fun getBackingArray(): ByteArray = buf
     private val bb: ByteBuffer = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
@@ -129,160 +133,132 @@ class GameProtocol() {
         return result == 0
     }
     @OptIn(ExperimentalUnsignedTypes::class)
-    fun parseGameLoginPacket(packetBytes: ByteArray): ParsedLogin? {
+    fun parseGameLoginPacket(packetBytes: ByteArray): ParsedLoginResult {
         var nb = NetworkBuffer(packetBytes)
+
         try {
+            // --- PRELIM CHECKS (before XTEA) ---
             if (nb.remaining() < 2 + 2 + 4) {
-                println("Packet too short")
-                return null
+                return ParsedLoginResult.FailureBeforeXtea("Packet too short")
             }
-            val randomTrash1 = nb.get8()
-            val randomTrash2 = nb.get8()
-            val randomTrash3 = nb.get8()
-            val randomTrash4 = nb.get8()
-            val randomTrash5 = nb.get8()
-            val randomTrash6 = nb.get8()
+
+            repeat(6) { nb.get8() } // trash bytes
 
             val os = nb.get16()
             val version = nb.get16()
             val clientVersion = nb.get32()
             val oldProtocol = version <= 1100
-            println("OS=$os version=$version oldProtocol=$oldProtocol clientVersion=$clientVersion")
 
             var versionString: String? = null
             var assetHash: String? = null
             var datRevision: Int? = null
+
             if (!oldProtocol) {
                 versionString = nb.readTibiaString()
-                println("versionString='$versionString'")
                 if (version >= 1334) {
                     assetHash = nb.readTibiaString()
-                    println("assetHash='$assetHash'")
                 }
             }
             if (version < 1334 && nb.remaining() >= 2) {
                 datRevision = nb.get16()
-                println("datRevision=$datRevision")
             }
 
             val preview = nb.getByte()
-            println("preview=$preview")
 
-            // RSA decrypt
-            //val ok = rsaDecryptInPlace(nb)
-            val decrypted = RSA_2.decrypt(nb.getBytes(minOf(nb.remaining(), 128)), RSA_PRIVATE_KEY)
+            // --- RSA ---
+            val decrypted = RSA_2.decrypt(
+                nb.getBytes(minOf(nb.remaining(), 128)),
+                RSA_PRIVATE_KEY
+            )
             nb = NetworkBuffer(decrypted)
-            val firstByte = nb.getByte()
-            val ok = firstByte == 0x00
-            if (!ok) {
-                println("RSA decrypt failed (first byte != 0)")
-                //return null
-            }
-            println("RSA decrypted OK")
 
-            // XTEA key
-            var xtea: UIntArray? = null
-            if (nb.remaining() >= 16) {
-                val arr = UIntArray(4)
-                for (i in 0..3) arr[i] = nb.get32().toUInt()
-                xtea = arr
-                println("XTEA: ${arr.joinToString { "0x${it.toString(16)}" }}")
-            }
-            if (xtea == null) {
-                return null
+            if (nb.getByte().toByte() != 0x00.toByte()) {
+                return ParsedLoginResult.FailureBeforeXtea("RSA decrypt failed")
             }
 
-            val gmByte = nb.getByte()
-            val gm = if (nb.remaining() >= 1) gmByte != 0 else false
-            println("GM=$gm")
+            // --- XTEA KEY (critical boundary) ---
+            val xtea = if (nb.remaining() >= 16) {
+                UIntArray(4) { nb.get32().toUInt() }.toIntArray()
+            } else {
+                return ParsedLoginResult.FailureBeforeXtea("Missing XTEA key")
+            }
 
+            // FROM THIS POINT ON, WE HAVE XTEA → FAILURES SWITCH MODE
+
+            val gm = nb.getByte().toInt() != 0
             val sessionRaw = nb.readTibiaString()
-            println("sessionRaw='$sessionRaw'")
 
-            val parts = listOf(sessionRaw.substring(0,32), sessionRaw.substring(32, sessionRaw.length))
-            if (parts.size != 2) {
-                println("Invalid session format")
-                return null
+            if (sessionRaw.length < 33) {
+                return ParsedLoginResult.FailureAfterXtea("Invalid session format", xtea)
             }
 
-            val token = parts[0]
-            val clientHmac = parts[1]
+            val token = sessionRaw.substring(0,32)
+            val clientHmac = sessionRaw.substring(32)
+            val serverHmac = generateHMACSHA256TRIMMED(
+                token,
+                "2e8498c0487c5b77833bdb8df82d9db77e414fb4ca2da559aec70d83148b25d7"
+            )
 
-            // compute server-side HMAC
-            val serverHmac =
-                generateHMACSHA256TRIMMED(token, "2e8498c0487c5b77833bdb8df82d9db77e414fb4ca2da559aec70d83148b25d7")
             if (!fastEquals(serverHmac, clientHmac)) {
-                println("Invalid HMAC")
-                return null
+                return ParsedLoginResult.FailureAfterXtea("Invalid authentication token", xtea)
             }
 
-            // optional linux strings
             if (!oldProtocol && os == 0x0C) {
-                if (nb.remaining() >= 2) println("linux1='${nb.readTibiaString()}'")
-                if (nb.remaining() >= 2) println("linux2='${nb.readTibiaString()}'")
+                if (nb.remaining() >= 2) nb.readTibiaString()
+                if (nb.remaining() >= 2) nb.readTibiaString()
             }
 
             val charName = nb.readTibiaString()
-            println("charName='$charName'")
 
             val (player, account, validToken) = transaction {
                 val player = Player.find { PlayersTable.name eq charName }.firstOrNull()
-
-                if (player == null) return@transaction Triple(null, null, null)
-
-                val account = player.account
-
-                val validToken = AccountToken.find {
-                    (AccountTokenTable.accountId eq account.id) and
-                            (AccountTokenTable.token eq token)
-                }.firstOrNull()
-
-                Triple(player, account, validToken)
+                val account = player?.account
+                val tokenObj = account?.let {
+                    AccountToken.find {
+                        (AccountTokenTable.accountId eq it.id) and
+                                (AccountTokenTable.token eq token)
+                    }.firstOrNull()
+                }
+                Triple(player, account, tokenObj)
             }
 
-            // now check outside
             if (player == null) {
-                println("Character not found")
-                return null
-            }
-            if (account == null) {
-                println("Character has no account")
-                return null
+                return ParsedLoginResult.FailureAfterXtea("Character does not exist", xtea)
             }
             if (validToken == null) {
-                println("Token not found for account")
-                return null
-            }
-            val now = LocalDateTime.now()
-            if (validToken.expiresAt < now) {
-                println("Token expired")
-                return null
+                return ParsedLoginResult.FailureAfterXtea("Authentication token invalid", xtea)
             }
 
-            var stamp = 0
-            if (nb.remaining() >= 4) {
-                stamp = nb.getInt()
-                println("stamp=$stamp")
+            if (validToken.expiresAt < LocalDateTime.now()) {
+                return ParsedLoginResult.FailureAfterXtea("Authentication token expired", xtea)
             }
 
-            var rand = 0
-            if (nb.remaining() >= 1) {
-                rand = nb.getByte()
-                println("rand=$rand")
-            }
+            val stamp = if (nb.remaining() >= 4) nb.getInt() else 0
+            val rand  = if (nb.remaining() >= 1) nb.getByte() else 0
 
-            return ParsedLogin(
-                os, version, oldProtocol, clientVersion,
-                versionString, assetHash, datRevision, preview,
-                xtea.toIntArray(), gm, charName, stamp, rand
+            return ParsedLoginResult.Success(
+                ParsedLogin(
+                    operatingSystem = os,
+                    version = version,
+                    oldProtocol = oldProtocol,
+                    clientVersion = clientVersion,
+                    versionString = versionString,
+                    assetHash = assetHash,
+                    datRevision = datRevision,
+                    previewState = preview,
+                    xteaKey = xtea,
+                    isGameMaster = gm,
+                    characterName = charName,
+                    timestamp = stamp,
+                    randomByte = rand.toInt()
+                )
             )
 
         } catch (ex: Exception) {
-            println("Parse error: ${ex.message}")
-            ex.printStackTrace()
-            return null
+            return ParsedLoginResult.FailureBeforeXtea("Exception: ${ex.message}")
         }
     }
+
 }
 
 data class ParsedLogin(
@@ -376,33 +352,38 @@ class GameServer(private val port: Int, private val pemPath: String) {
     }
 
     private fun handleClient(client: SocketChannel) {
-        try {
-            val sock = client.socket()
-            sendChallenge(client)
-            //val handshake = readHandshake(client)
-            //println("Handshake from ${sock.remoteSocketAddress}: '$handshake'")
-            val packet = readPacket(client) ?: run {
-                println("Failed reading packet")
-                client.close(); return
-            }
-            println("Received packet ${packet.size} bytes")
-            val parsed = protocol.parseGameLoginPacket(packet)
-            if (parsed != null) {
-                val session = GameClientSession(client, parsed.xteaKey)
+        sendChallenge(client)
 
+        val packet = readPacket(client) ?: run {
+            client.close(); return
+        }
+
+        when (val result = protocol.parseGameLoginPacket(packet)) {
+            is ParsedLoginResult.FailureBeforeXtea -> {
+                // We cannot send encrypted disconnect since we have no XTEA
+                println("Login fail (pre-XTEA): ${result.reason}")
+                client.close()
+            }
+
+            is ParsedLoginResult.FailureAfterXtea -> {
+                println("Login fail (post-XTEA): ${result.reason}")
+
+                val session = GameClientSession(client, result.xtea)
+
+                // example: send Tibia-style disconnect
+                session.disconnectClient(result.reason)
+
+                client.close()
+            }
+
+            is ParsedLoginResult.Success -> {
+                val session = GameClientSession(client, result.login.xteaKey)
                 session.sendAddCreature()
-
-                //session.disconnectClient("You may only login with 1 character\nof your account at the same time.")
-                println("Parsed login: characterName='${parsed.characterName}'")
-            } else {
-                println("Failed to parse login packet")
+                println("Login OK: ${result.login.characterName}")
             }
-        } catch (e: Exception) {
-            println("Client error: ${e.message}"); e.printStackTrace()
-        } finally {
-            //try { client.close() } catch (_: Exception) {}
         }
     }
+
 
     private fun readHandshake(client: SocketChannel): String {
         val sb = StringBuilder()
